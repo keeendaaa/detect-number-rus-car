@@ -97,3 +97,15 @@ runs/ocr/<имя_файла>/
 ```text
 Х797ВТ178
 ```
+
+### Исходное фото
+
+![Исходное фото](docs/examples/source_example.png)
+
+### Результат детекции и OCR
+
+![Результат детекции и OCR](docs/examples/result_example.png)
+
+### Выровненный номер для OCR
+
+![Выровненный номер](docs/examples/warped_example.png)
