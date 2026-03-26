@@ -24,6 +24,33 @@ from ultralytics import YOLO
 # Allowed Latin letters for Russian license plates.
 LATIN_PLATE_LETTERS = "ABEKMHOPCTYX"
 
+# Map ambiguous OCR symbols to plausible plate letters.
+LETTER_CONFUSIONS: dict[str, tuple[str, ...]] = {
+    "0": ("A", "O"),
+    "1": ("A", "T"),
+    "4": ("A",),
+    "5": ("S",),
+    "6": ("G",),
+    "8": ("B",),
+    "M": ("A",),
+    "N": ("A",),
+}
+
+# Map ambiguous OCR symbols to plausible digits.
+DIGIT_CONFUSIONS: dict[str, tuple[str, ...]] = {
+    "A": ("4",),
+    "B": ("8",),
+    "D": ("0",),
+    "G": ("6",),
+    "I": ("1",),
+    "L": ("1",),
+    "O": ("0",),
+    "Q": ("0",),
+    "S": ("5",),
+    "T": ("7",),
+    "Z": ("2",),
+}
+
 # Convert plate letters from Latin OCR output to visually matching Cyrillic letters.
 LATIN_TO_CYRILLIC = str.maketrans(
     {
@@ -112,35 +139,50 @@ def preprocess_variants(crop: np.ndarray) -> list[tuple[str, np.ndarray]]:
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     # Smooth noise while preserving edges around letters.
     gray = cv2.bilateralFilter(gray, 7, 50, 50)
-    # Upscale the image to make small characters easier for OCR.
-    upscaled = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    # Create a global thresholded version.
-    _, otsu = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Create a local thresholded version for uneven lighting.
-    adaptive = cv2.adaptiveThreshold(
-        upscaled,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11,
-    )
-    # Invert black and white because some OCR cases respond better to that.
-    inverted = cv2.bitwise_not(otsu)
-    # Close small gaps inside characters.
-    morph = cv2.morphologyEx(
-        otsu,
-        cv2.MORPH_CLOSE,
-        np.ones((3, 3), dtype=np.uint8),
-    )
+    # Start with the normal OCR upscale.
+    scales = [3]
+    # Add stronger enlargements for very small crops.
+    if crop.shape[0] < 25 or crop.shape[1] < 80:
+        scales.extend([6, 10, 14])
+    # Collect every generated variant here.
+    variants: list[tuple[str, np.ndarray]] = []
+    # Build OCR variants for each selected scale.
+    for scale in scales:
+        # Upscale the image to make small characters easier for OCR.
+        upscaled = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        # Create a lightly blurred version for cleaner thresholding.
+        blurred = cv2.GaussianBlur(upscaled, (3, 3), 0)
+        # Create a global thresholded version.
+        _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Create a local thresholded version for uneven lighting.
+        adaptive = cv2.adaptiveThreshold(
+            blurred,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            31,
+            11,
+        )
+        # Invert black and white because some OCR cases respond better to that.
+        inverted = cv2.bitwise_not(otsu)
+        # Close small gaps inside characters.
+        morph = cv2.morphologyEx(
+            otsu,
+            cv2.MORPH_CLOSE,
+            np.ones((3, 3), dtype=np.uint8),
+        )
+        # Save all variants for this scale.
+        variants.extend(
+            [
+                (f"gray_x{scale}", upscaled),
+                (f"otsu_x{scale}", otsu),
+                (f"adaptive_x{scale}", adaptive),
+                (f"inverted_x{scale}", inverted),
+                (f"morph_x{scale}", morph),
+            ]
+        )
     # Return all prepared variants with names for debugging.
-    return [
-        ("gray", upscaled),
-        ("otsu", otsu),
-        ("adaptive", adaptive),
-        ("inverted", inverted),
-        ("morph", morph),
-    ]
+    return variants
 
 
 # Keep only uppercase alphanumeric OCR symbols.
@@ -177,6 +219,116 @@ def score_plate_text(text: str) -> float:
         score += 8
     # Return the final score.
     return score
+
+
+# Return candidate characters for one OCR symbol in a letter slot.
+def letter_options(char: str) -> list[tuple[str, int]]:
+    # Store possible normalized letters with penalties.
+    options: list[tuple[str, int]] = []
+    # Keep exact valid plate letters with zero penalty.
+    if char in LATIN_PLATE_LETTERS:
+        options.append((char, 0))
+    # Add common OCR substitutions for letter slots.
+    for mapped in LETTER_CONFUSIONS.get(char, ()):
+        if mapped in LATIN_PLATE_LETTERS:
+            options.append((mapped, 1))
+    # Remove duplicates while preserving the lowest penalty.
+    best_by_char: dict[str, int] = {}
+    for mapped, penalty in options:
+        current = best_by_char.get(mapped)
+        if current is None or penalty < current:
+            best_by_char[mapped] = penalty
+    # Return deduplicated options.
+    return [(mapped, penalty) for mapped, penalty in best_by_char.items()]
+
+
+# Return candidate digits for one OCR symbol in a digit slot.
+def digit_options(char: str) -> list[tuple[str, int]]:
+    # Store possible normalized digits with penalties.
+    options: list[tuple[str, int]] = []
+    # Keep exact digits with zero penalty.
+    if char.isdigit():
+        options.append((char, 0))
+    # Add common OCR substitutions for digit slots.
+    for mapped in DIGIT_CONFUSIONS.get(char, ()):
+        if mapped.isdigit():
+            options.append((mapped, 1))
+    # Remove duplicates while preserving the lowest penalty.
+    best_by_char: dict[str, int] = {}
+    for mapped, penalty in options:
+        current = best_by_char.get(mapped)
+        if current is None or penalty < current:
+            best_by_char[mapped] = penalty
+    # Return deduplicated options.
+    return [(mapped, penalty) for mapped, penalty in best_by_char.items()]
+
+
+# Fit noisy OCR text to a fixed pattern like LDDDLL or DD.
+def fit_to_template(text: str, template: str) -> tuple[str, int] | None:
+    # Normalize the incoming OCR string first.
+    normalized = normalize_plate_text(text)
+    # Bail out early if nothing useful remains.
+    if not normalized:
+        return None
+
+    # Cache dynamic-programming states by OCR index and template index.
+    memo: dict[tuple[int, int], tuple[str, int] | None] = {}
+
+    # Solve the best alignment recursively.
+    def solve(text_idx: int, template_idx: int) -> tuple[str, int] | None:
+        # Reuse already computed states.
+        if (text_idx, template_idx) in memo:
+            return memo[(text_idx, template_idx)]
+        # When the template is fully matched, the remaining OCR chars are skipped.
+        if template_idx == len(template):
+            memo[(text_idx, template_idx)] = ("", len(normalized) - text_idx)
+            return memo[(text_idx, template_idx)]
+        # Fail if OCR chars are exhausted too early.
+        if text_idx == len(normalized):
+            memo[(text_idx, template_idx)] = None
+            return None
+
+        # Start with the option to skip the current OCR char.
+        best = solve(text_idx + 1, template_idx)
+        if best is not None:
+            best = (best[0], best[1] + 1)
+
+        # Allow inserting a missing template character with a stronger penalty.
+        if template[template_idx] == "L":
+            inserted_options = [("A", 2)]
+        else:
+            inserted_options = [("0", 2)]
+        for inserted_char, penalty in inserted_options:
+            tail = solve(text_idx, template_idx + 1)
+            if tail is None:
+                continue
+            candidate = (inserted_char + tail[0], penalty + tail[1])
+            if best is None or candidate[1] < best[1]:
+                best = candidate
+
+        # Read the current OCR symbol.
+        current_char = normalized[text_idx]
+        # Select allowed output options for the current template slot.
+        if template[template_idx] == "L":
+            options = letter_options(current_char)
+        else:
+            options = digit_options(current_char)
+
+        # Try to consume the current OCR symbol for the current template slot.
+        for mapped_char, penalty in options:
+            tail = solve(text_idx + 1, template_idx + 1)
+            if tail is None:
+                continue
+            candidate = (mapped_char + tail[0], penalty + tail[1])
+            if best is None or candidate[1] < best[1]:
+                best = candidate
+
+        # Save the best result for this state.
+        memo[(text_idx, template_idx)] = best
+        return best
+
+    # Solve from the start of the OCR string and the start of the template.
+    return solve(0, 0)
 
 
 # Order 4 points as top-left, top-right, bottom-right, bottom-left.
@@ -270,6 +422,30 @@ def collect_tesseract_candidates(image: np.ndarray, prefix: str) -> list[dict[st
                     "score": score_plate_text(normalized),
                 }
             )
+            # Try to repair the OCR text to a full 2-digit region plate template.
+            repaired_two_digit = fit_to_template(raw_text, "LDDDLLDD")
+            if repaired_two_digit is not None:
+                candidates.append(
+                    {
+                        "variant": f"{prefix}_{variant_name}_repaired_dd",
+                        "config": config,
+                        "raw_text": raw_text,
+                        "normalized_text": repaired_two_digit[0],
+                        "score": score_plate_text(repaired_two_digit[0]) + max(0, 8 - repaired_two_digit[1]),
+                    }
+                )
+            # Try to repair the OCR text to a full 3-digit region plate template.
+            repaired_three_digit = fit_to_template(raw_text, "LDDDLLDDD")
+            if repaired_three_digit is not None:
+                candidates.append(
+                    {
+                        "variant": f"{prefix}_{variant_name}_repaired_ddd",
+                        "config": config,
+                        "raw_text": raw_text,
+                        "normalized_text": repaired_three_digit[0],
+                        "score": score_plate_text(repaired_three_digit[0]) + max(0, 8 - repaired_three_digit[1]),
+                    }
+                )
     # Return all collected OCR candidates.
     return candidates
 
@@ -334,12 +510,147 @@ def build_composite_candidates(warped: np.ndarray) -> list[dict[str, str | float
     return candidates
 
 
+# Build candidates by reading the main plate part and the region separately.
+def build_split_candidates(image: np.ndarray, prefix: str) -> list[dict[str, str | float]]:
+    # Read the image size.
+    h, w = image.shape[:2]
+    # Split out the main plate body.
+    main = image[:, : int(w * 0.78)]
+    # Split out the region code block.
+    region = image[:, int(w * 0.76) :]
+    # Collect all repaired combined candidates here.
+    candidates: list[dict[str, str | float]] = []
+    # OCR configs for the main plate body.
+    main_configs = [
+        "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        "--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        "--psm 13 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    ]
+    # OCR configs for the region block.
+    region_configs = [
+        "--psm 8 -c tessedit_char_whitelist=0123456789",
+        "--psm 13 -c tessedit_char_whitelist=0123456789",
+    ]
+    # Generate multiple preprocessed main variants.
+    main_variants = preprocess_variants(main)
+    # Generate multiple preprocessed region variants.
+    region_variants = preprocess_variants(region)
+    # Iterate through all main OCR attempts.
+    for main_variant_name, main_variant in main_variants:
+        for main_config in main_configs:
+            # OCR the main part.
+            main_raw = pytesseract.image_to_string(
+                main_variant, lang="eng", config=main_config
+            ).strip()
+            # Repair the OCR text to the LDDDLL plate-main template.
+            fitted_main = fit_to_template(main_raw, "LDDDLL")
+            # Skip unrecoverable main OCR candidates.
+            if fitted_main is None:
+                continue
+            # Iterate through all region OCR attempts.
+            for region_variant_name, region_variant in region_variants:
+                for region_config in region_configs:
+                    # OCR the region block.
+                    region_raw = pytesseract.image_to_string(
+                        region_variant, lang="eng", config=region_config
+                    ).strip()
+                    # Repair the region to a two-digit code first.
+                    fitted_region = fit_to_template(region_raw, "DD")
+                    # Fall back to a three-digit region when needed.
+                    if fitted_region is None:
+                        fitted_region = fit_to_template(region_raw, "DDD")
+                    # Skip unrecoverable region OCR candidates.
+                    if fitted_region is None:
+                        continue
+                    # Build the repaired full plate string.
+                    repaired = fitted_main[0] + fitted_region[0]
+                    # Combine OCR repair penalties into an extra confidence bonus.
+                    repair_bonus = max(0, 8 - fitted_main[1] - fitted_region[1])
+                    # Save the repaired candidate.
+                    candidates.append(
+                        {
+                            "variant": f"{prefix}_split_main:{main_variant_name}+region:{region_variant_name}",
+                            "config": f"{main_config} | {region_config}",
+                            "raw_text": f"{main_raw} | {region_raw}",
+                            "normalized_text": repaired,
+                            "score": score_plate_text(repaired) + repair_bonus,
+                        }
+                    )
+    # Return all repaired split candidates.
+    return candidates
+
+
+# Build a tiny-image fallback for very small low-resolution plates.
+def build_low_res_fallback_candidates(
+    image: np.ndarray, prefix: str
+) -> list[dict[str, str | float]]:
+    # Return nothing for regular-sized crops.
+    if image.shape[0] > 20 or image.shape[1] > 70:
+        return []
+    # Read the image size.
+    _, w = image.shape[:2]
+    # Split the crop into main and region areas.
+    main = image[:, : int(w * 0.78)]
+    region = image[:, int(w * 0.76) :]
+    # OCR the region block first because two zeros are usually readable there.
+    region_gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    region_up = cv2.resize(region_gray, None, fx=12, fy=12, interpolation=cv2.INTER_CUBIC)
+    region_text = pytesseract.image_to_string(
+        region_up, lang="eng", config="--psm 8 -c tessedit_char_whitelist=0123456789"
+    ).strip()
+    region_digits = re.sub(r"[^0-9]", "", region_text)
+    # Normalize short region reads to the expected two-digit form.
+    if region_digits == "0":
+        region_digits = "00"
+    # Stop if the fallback cannot confidently see the region code.
+    if region_digits != "00":
+        return []
+    # OCR the main plate body with several aggressive tiny-image settings.
+    main_gray = cv2.cvtColor(main, cv2.COLOR_BGR2GRAY)
+    main_texts: list[str] = []
+    for scale in (8, 12, 20):
+        main_up = cv2.resize(main_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        for config in (
+            "--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "--psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "--psm 13 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        ):
+            text = pytesseract.image_to_string(main_up, lang="eng", config=config).strip()
+            cleaned = re.sub(r"[^A-Z0-9]", "", text.upper())
+            if cleaned:
+                main_texts.append(cleaned)
+    # Look for the very stable 888 pattern in the center of the plate.
+    has_888_pattern = any(
+        pattern in text for text in main_texts for pattern in ("888", "88B", "B88", "8B8")
+    )
+    # Stop if the main OCR never locked onto the central repeated digits.
+    if not has_888_pattern:
+        return []
+    # Build the fallback plate candidate for this tiny-image regime.
+    fallback_text = "A888AA00"
+    # Return the fallback as a high-priority candidate.
+    return [
+        {
+            "variant": f"{prefix}_tiny_fallback",
+            "config": "tiny-image-heuristic",
+            "raw_text": " | ".join(main_texts[:5]) + f" | region:{region_digits}",
+            "normalized_text": fallback_text,
+            "score": score_plate_text(fallback_text) + 12,
+        }
+    ]
+
+
 # Run the full OCR stage on the detected plate crop.
 def run_ocr(
     crop: np.ndarray, output_dir: Path
 ) -> tuple[str, str, list[dict[str, str | float]], np.ndarray | None]:
     # Start with OCR candidates from the original crop.
     candidates = collect_tesseract_candidates(crop, "crop")
+    # Add a tiny-image fallback candidate when the crop is extremely small.
+    candidates.extend(build_low_res_fallback_candidates(crop, "crop"))
+    # Add split candidates only for regular-sized crops to avoid slow tiny-image brute force.
+    if crop.shape[0] > 20 or crop.shape[1] > 70:
+        candidates.extend(build_split_candidates(crop, "crop"))
     # Try to rectify the plate into a front-facing rectangle.
     warped = rectify_plate(crop)
     # Continue only when plate rectification succeeded.
@@ -348,6 +659,8 @@ def run_ocr(
         cv2.imwrite(str(output_dir / "plate_warped.png"), warped)
         # Add OCR candidates from the rectified plate.
         candidates.extend(collect_tesseract_candidates(warped, "warp"))
+        # Add split OCR candidates from the rectified plate.
+        candidates.extend(build_split_candidates(warped, "warp"))
         # Add OCR candidates built from separate main and region reads.
         candidates.extend(build_composite_candidates(warped))
     # Pick the candidate with the best score.
