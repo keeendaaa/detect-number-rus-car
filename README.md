@@ -1,61 +1,99 @@
-# ml_ludy_obuchenie
+# detect-number-rus-car
 
-YOLO26 training on Windows
+Скрипт для распознавания российских автомобильных номеров по изображению.
 
-## Setup
+Проект делает 2 шага:
 
-PowerShell:
+1. `YOLO` находит номерной знак на изображении.
+2. `Tesseract OCR` читает текст номера с вырезанного и выровненного кропа.
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+## Что лежит в проекте
+
+- `exp.pt` — обученные веса детектора номерных знаков.
+- `plate_ocr.py` — основной скрипт для детекции и OCR.
+
+## Требования
+
+- Python `3.11+`
+- `tesseract` установлен в системе
+- macOS/Linux терминал
+
+## Установка
+
+Создай виртуальное окружение:
+
+```bash
+python3 -m venv .venv
 ```
 
-Command Prompt:
+Активируй его:
 
-```bat
-py -m venv .venv
-.\.venv\Scripts\activate.bat
-python -m pip install -r requirements.txt
+```bash
+source .venv/bin/activate
 ```
 
-If PowerShell blocks activation, run:
+Установи Python-зависимости:
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```bash
+pip install -r requirements.txt
 ```
 
-## Train on Kaggle dataset
+Установи `tesseract`:
 
-PowerShell:
+### macOS
 
-```powershell
-python .\train_yolo26.py `
-  --dataset fareselmenshawii/human-dataset `
-  --model yolo26n.pt `
-  --epochs 100 `
-  --imgsz 640 `
-  --batch 16 `
-  --device cpu
+```bash
+brew install tesseract
 ```
 
-Command Prompt:
+### Ubuntu/Debian
 
-```bat
-python train_yolo26.py ^
-  --dataset fareselmenshawii/human-dataset ^
-  --model yolo26n.pt ^
-  --epochs 100 ^
-  --imgsz 640 ^
-  --batch 16 ^
-  --device cpu
+```bash
+sudo apt update
+sudo apt install tesseract-ocr
 ```
 
-Notes:
+## Запуск
 
-- For NVIDIA GPU, usually use `--device 0`.
-- For CPU, use `--device cpu`.
-- `mps` is only for macOS, not Windows.
-- If the dataset is already in YOLO format, the script will generate `data.yaml` automatically.
-- COCO and Pascal VOC detection layouts are also supported.
+Пример запуска на одном изображении:
+
+```bash
+.venv/bin/python plate_ocr.py --model exp.pt --source image.png
+```
+
+Или после активации окружения:
+
+```bash
+python plate_ocr.py --model exp.pt --source image.png
+```
+
+## Аргументы
+
+- `--model` — путь к весам YOLO, по умолчанию `exp.pt`
+- `--source` — путь к изображению
+- `--output-dir` — папка для результатов, по умолчанию `runs/ocr`
+- `--conf` — порог уверенности детектора
+- `--padding` — дополнительный отступ вокруг номера
+
+## Результаты
+
+После запуска появится папка вида:
+
+```bash
+runs/ocr/<имя_файла>/
+```
+
+В ней будут:
+
+- `plate_crop.png` — исходный кроп номерного знака
+- `plate_warped.png` — выровненный номер для OCR
+- `annotated.png` — исходное изображение с боксом и текстом
+- `result.json` — полный отчет с OCR-кандидатами
+
+## Пример
+
+Для `image.png` скрипт распознал номер:
+
+```text
+Х797ВТ178
+```

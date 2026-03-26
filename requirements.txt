@@ -1,2 +1,4 @@
-kagglehub==1.0.0
-ultralytics==8.4.27
+ultralytics
+opencv-python
+numpy
+pytesseract

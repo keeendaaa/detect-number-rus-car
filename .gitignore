@@ -1,5 +1,15 @@
+# Python virtual environment
 .venv/
+
+# Python cache
 __pycache__/
-datasets/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Generated outputs
 runs/
-*.pt
+
+# Local test images
+image.png
